@@ -62,7 +62,7 @@ bitflags! {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SubpassData<T> {
-    pub colors: ArrayVec<[T; MAX_COLOR_ATTACHMENTS]>,
+    pub colors: ArrayVec<T, MAX_COLOR_ATTACHMENTS>,
     pub depth_stencil: Option<T>,
 }
 

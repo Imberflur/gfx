@@ -1003,7 +1003,7 @@ impl hal::device::Device<Backend> for Device {
 
         let mut subpasses: Vec<n::Subpass> = subpasses
             .map(|sub| {
-                let mut colors: ArrayVec<[_; MAX_COLOR_ATTACHMENTS]> = sub
+                let mut colors: ArrayVec<_, MAX_COLOR_ATTACHMENTS> = sub
                     .colors
                     .iter()
                     .map(|&(id, _)| {

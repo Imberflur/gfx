@@ -548,7 +548,7 @@ impl Queue {
                 let gl_indices = indices
                     .iter()
                     .map(|&i| glow::COLOR_ATTACHMENT0 + i as u32)
-                    .collect::<ArrayVec<[_; MAX_COLOR_ATTACHMENTS]>>();
+                    .collect::<ArrayVec<_, MAX_COLOR_ATTACHMENTS>>();
                 unsafe { self.share.context.draw_buffers(&gl_indices) };
             }
             com::Command::SetPatchSize(num) => unsafe {

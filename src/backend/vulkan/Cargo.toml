@@ -20,7 +20,7 @@ use-rtld-next = ["libc"]
 name = "gfx_backend_vulkan"
 
 [dependencies]
-arrayvec = "0.5"
+arrayvec = "0.7.4"
 byteorder = "1"
 log = "0.4"
 libc = { version = "0.2", optional = true }

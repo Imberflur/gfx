@@ -20,13 +20,13 @@ use ash::vk::Handle;
 #[derive(Debug, Default)]
 struct GraphicsPipelineInfoBuf<'a> {
     // 10 is the max amount of dynamic states
-    dynamic_states: ArrayVec<[vk::DynamicState; 10]>,
+    dynamic_states: ArrayVec<vk::DynamicState, 10>,
 
     // 5 is the amount of stages
-    c_strings: ArrayVec<[CString; 5]>,
-    stages: ArrayVec<[vk::PipelineShaderStageCreateInfo; 5]>,
-    specializations: ArrayVec<[vk::SpecializationInfo; 5]>,
-    specialization_entries: ArrayVec<[SmallVec<[vk::SpecializationMapEntry; 4]>; 5]>,
+    c_strings: ArrayVec<CString, 5>,
+    stages: ArrayVec<vk::PipelineShaderStageCreateInfo, 5>,
+    specializations: ArrayVec<vk::SpecializationInfo, 5>,
+    specialization_entries: ArrayVec<SmallVec<[vk::SpecializationMapEntry; 4]>, 5>,
 
     vertex_bindings: Vec<vk::VertexInputBindingDescription>,
     vertex_attributes: Vec<vk::VertexInputAttributeDescription>,

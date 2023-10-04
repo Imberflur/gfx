@@ -105,10 +105,10 @@ pub enum Command {
     BindFramebuffer {
         target: FrameBufferTarget,
         framebuffer: n::RawFramebuffer,
-        colors: ArrayVec<[n::ImageView; MAX_COLOR_ATTACHMENTS]>,
+        colors: ArrayVec<n::ImageView, MAX_COLOR_ATTACHMENTS>,
         depth_stencil: Option<n::ImageView>,
     },
-    SetDrawColorBuffers(ArrayVec<[u8; MAX_COLOR_ATTACHMENTS]>),
+    SetDrawColorBuffers(ArrayVec<u8, MAX_COLOR_ATTACHMENTS>),
     SetPatchSize(i32),
     BindProgram(<GlContext as glow::HasContext>::Program),
     SetBlend(Option<pso::BlendState>),

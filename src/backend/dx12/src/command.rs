@@ -429,12 +429,12 @@ pub struct CommandBuffer {
     /// D3D12 only allows setting all viewports or all scissors at once, not partial updates.
     /// So we must cache the implied state for these partial updates.
     viewport_cache: ArrayVec<
-        [d3d12::D3D12_VIEWPORT;
-            d3d12::D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE as usize],
+        d3d12::D3D12_VIEWPORT,
+            d3d12::D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE as usize,
     >,
     scissor_cache: ArrayVec<
-        [d3d12::D3D12_RECT;
-            d3d12::D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE as usize],
+        d3d12::D3D12_RECT,
+            d3d12::D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE as usize,
     >,
 
     /// HACK: renderdoc workaround for temporary RTVs
@@ -1079,7 +1079,7 @@ impl CommandBuffer {
                         }
                     })
                 })
-                .collect::<ArrayVec<[_; MAX_VERTEX_BUFFERS]>>();
+                .collect::<ArrayVec<_, MAX_VERTEX_BUFFERS>>();
 
             if buffers.is_empty() {
                 last_end_slot = start_slot + 1;
@@ -2098,7 +2098,7 @@ impl com::CommandBuffer<Backend> for CommandBuffer {
         I: Iterator<Item = &'a r::DescriptorSet>,
         J: Iterator<Item = com::DescriptorSetOffset>,
     {
-        let set_array = sets.collect::<ArrayVec<[_; MAX_DESCRIPTOR_SETS]>>();
+        let set_array = sets.collect::<ArrayVec<_, MAX_DESCRIPTOR_SETS>>();
         self.active_descriptor_heaps = self
             .gr_pipeline
             .bind_descriptor_sets(layout, first_set, &set_array, offsets);
@@ -2137,7 +2137,7 @@ impl com::CommandBuffer<Backend> for CommandBuffer {
         I: Iterator<Item = &'a r::DescriptorSet>,
         J: Iterator<Item = com::DescriptorSetOffset>,
     {
-        let set_array = sets.collect::<ArrayVec<[_; MAX_DESCRIPTOR_SETS]>>();
+        let set_array = sets.collect::<ArrayVec<_, MAX_DESCRIPTOR_SETS>>();
         self.active_descriptor_heaps = self
             .comp_pipeline
             .bind_descriptor_sets(layout, first_set, &set_array, offsets);

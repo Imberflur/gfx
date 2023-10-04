@@ -354,7 +354,7 @@ struct State {
     resources_vs: StageResources,
     resources_ps: StageResources,
     resources_cs: StageResources,
-    descriptor_sets: ArrayVec<[DescriptorSetInfo; MAX_BOUND_DESCRIPTOR_SETS]>,
+    descriptor_sets: ArrayVec<DescriptorSetInfo, MAX_BOUND_DESCRIPTOR_SETS>,
     index_buffer: Option<IndexBuffer<BufferPtr>>,
     vertex_buffers: Vec<Option<(BufferPtr, u64)>>,
     active_depth_stencil_desc: pso::DepthStencilDesc,
@@ -775,7 +775,9 @@ impl State {
         result_sizes.clear();
         for br in stage_info.sized_bindings.iter() {
             // If it's None, this isn't the right time to update the sizes
-            let size = self.storage_buffer_length_map.get(&(br.group as pso::DescriptorSetIndex, br.binding))?;
+            let size = self
+                .storage_buffer_length_map
+                .get(&(br.group as pso::DescriptorSetIndex, br.binding))?;
             result_sizes.push(*size);
         }
         Some(slot as _)

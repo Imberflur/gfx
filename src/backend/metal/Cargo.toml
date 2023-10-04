@@ -25,7 +25,7 @@ name = "gfx_backend_metal"
 [dependencies]
 hal = { package = "gfx-hal", path = "../../hal", version = "0.8" }
 range-alloc = { path = "../../auxil/range-alloc", version = "0.1" }
-arrayvec = "0.5"
+arrayvec = "0.7.4"
 bitflags = "1.0"
 copyless = "0.1.4"
 fxhash = "0.2.1"
