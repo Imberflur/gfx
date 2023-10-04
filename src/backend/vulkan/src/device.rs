@@ -17,48 +17,70 @@ use std::{ffi::CString, marker::PhantomData, mem, ops::Range, ptr, sync::Arc};
 use crate::{command as cmd, conv, native as n, pool::RawCommandPool, window as w, Backend as B};
 use ash::vk::Handle;
 
-#[derive(Debug, Default)]
-struct GraphicsPipelineInfoBuf<'a> {
-    // 10 is the max amount of dynamic states
-    dynamic_states: ArrayVec<vk::DynamicState, 10>,
+use core::cell::{Cell, UnsafeCell};
+use core::mem::MaybeUninit;
 
-    // 5 is the amount of stages
-    c_strings: ArrayVec<CString, 5>,
-    stages: ArrayVec<vk::PipelineShaderStageCreateInfo, 5>,
-    specializations: ArrayVec<vk::SpecializationInfo, 5>,
-    specialization_entries: ArrayVec<SmallVec<[vk::SpecializationMapEntry; 4]>, 5>,
-
-    vertex_bindings: Vec<vk::VertexInputBindingDescription>,
-    vertex_attributes: Vec<vk::VertexInputAttributeDescription>,
-    blend_states: Vec<vk::PipelineColorBlendAttachmentState>,
-
-    sample_mask: [u32; 2],
-    vertex_input_state: vk::PipelineVertexInputStateCreateInfo,
-    input_assembly_state: vk::PipelineInputAssemblyStateCreateInfo,
-    tessellation_state: Option<vk::PipelineTessellationStateCreateInfo>,
-    viewport_state: vk::PipelineViewportStateCreateInfo,
-    rasterization_state: vk::PipelineRasterizationStateCreateInfo,
-    rasterization_conservative_state: vk::PipelineRasterizationConservativeStateCreateInfoEXT, // May be unused or may be pointed to by rasterization_state
-    multisample_state: vk::PipelineMultisampleStateCreateInfo,
-    depth_stencil_state: vk::PipelineDepthStencilStateCreateInfo,
-    color_blend_state: vk::PipelineColorBlendStateCreateInfo,
-    pipeline_dynamic_state: vk::PipelineDynamicStateCreateInfo,
-    viewports: [vk::Viewport; 1],
-    scissors: [vk::Rect2D; 1],
-
-    lifetime: PhantomData<&'a vk::Pipeline>,
+// Stand-in for ArrayVec with &self push
+struct PushArrayVec<T, const N: usize> {
+    len: Cell<usize>,
+    storage: [UnsafeCell<MaybeUninit<T>>; N],
 }
-impl<'a> GraphicsPipelineInfoBuf<'a> {
-    unsafe fn add_stage(&mut self, stage: vk::ShaderStageFlags, source: &pso::EntryPoint<'a, B>) {
-        let string = CString::new(source.entry).unwrap();
-        self.c_strings.push(string);
-        let name = self.c_strings.last().unwrap().as_c_str();
 
-        self.specialization_entries.push(
+impl<T, const N: usize> PushArrayVec<T, N> {
+    fn push(&self, val: T) -> &T {
+        let len = self.len.get();
+        // SAFETY: No references exist to unitilized slots and Self isn't Sync.
+        let slot = &self.storage[len];
+        unsafe { *slot.get() = MaybeUninit::new(val) };
+        self.len.set(len + 1);
+        // SAFETY: Initialized above, we hold a share ref and mutable access while shared ref is
+        // held doesn't occur after initialization.
+        unsafe { MaybeUninit::assume_init_ref(&*slot.get()) }
+    }
+}
+
+impl<T, const N: usize> Default for PushArrayVec<T, N> {
+    fn default() -> Self {
+        Self {
+            len: Cell::new(0),
+            storage: core::array::from_fn(|_| UnsafeCell::new(MaybeUninit::uninit())),
+        }
+    }
+}
+
+impl<T, const N: usize> core::ops::Deref for PushArrayVec<T, N> {
+    type Target = [T];
+
+    fn deref(&self) -> &Self::Target {
+        let slots = &self.storage[..self.len.get()];
+        // SAFETY: All slots up to the length are initialized and we have a shared ref. UnsafeCell
+        // and MaybeUninit are guaranteed to have the same layout as wrapped type.
+        unsafe { &*(slots as *const [UnsafeCell<MaybeUninit<T>>] as *const [T]) }
+    }
+}
+
+#[derive(Default)]
+struct StageInfoBuf<'a> {
+    // 5 is the amount of stages
+    c_strings: PushArrayVec<CString, 5>,
+    specialization_entries: PushArrayVec<SmallVec<[vk::SpecializationMapEntry; 4]>, 5>,
+    specializations: PushArrayVec<vk::SpecializationInfoBuilder<'a>, 5>,
+    // This is used with API that needs array of the non-builder version... we loose lifetime
+    // tracking though...
+    stages: PushArrayVec<vk::PipelineShaderStageCreateInfo /* Builder<'a> */, 5>,
+}
+
+impl<'a> StageInfoBuf<'a> {
+    unsafe fn add_stage(&'a self, stage: vk::ShaderStageFlags, source: &'a pso::EntryPoint<'a, B>) {
+        let string = CString::new(source.entry).unwrap();
+        let name = self.c_strings.push(string).as_c_str();
+
+        let map_entries = self.specialization_entries.push(
             source
                 .specialization
                 .constants
                 .iter()
+                // no pointers here so we don't need to use builder to capture lifetimes
                 .map(|c| vk::SpecializationMapEntry {
                     constant_id: c.id,
                     offset: c.range.start as _,
@@ -66,14 +88,12 @@ impl<'a> GraphicsPipelineInfoBuf<'a> {
                 })
                 .collect(),
         );
-        let map_entries = self.specialization_entries.last().unwrap();
 
-        self.specializations.push(vk::SpecializationInfo {
-            map_entry_count: map_entries.len() as _,
-            p_map_entries: map_entries.as_ptr(),
-            data_size: source.specialization.data.len() as _,
-            p_data: source.specialization.data.as_ptr() as _,
-        });
+        let specialization = self.specializations.push(
+            vk::SpecializationInfo::builder()
+                .map_entries(map_entries)
+                .data(&source.specialization.data),
+        );
 
         self.stages.push(
             vk::PipelineShaderStageCreateInfo::builder()
@@ -81,344 +101,9 @@ impl<'a> GraphicsPipelineInfoBuf<'a> {
                 .stage(stage)
                 .module(source.module.raw)
                 .name(name)
-                .specialization_info(self.specializations.last().unwrap())
+                .specialization_info(specialization)
                 .build(),
-        )
-    }
-
-    unsafe fn new(desc: &pso::GraphicsPipelineDesc<'a, B>, device: &super::RawDevice) -> Self {
-        let mut this = Self::default();
-
-        match desc.primitive_assembler {
-            pso::PrimitiveAssemblerDesc::Vertex {
-                ref buffers,
-                ref attributes,
-                ref input_assembler,
-                ref vertex,
-                ref tessellation,
-                ref geometry,
-            } => {
-                // Vertex stage
-                // vertex shader is required
-                this.add_stage(vk::ShaderStageFlags::VERTEX, vertex);
-
-                // Geometry stage
-                if let Some(ref entry) = geometry {
-                    this.add_stage(vk::ShaderStageFlags::GEOMETRY, entry);
-                }
-                // Tessellation stage
-                if let Some(ts) = tessellation {
-                    this.add_stage(vk::ShaderStageFlags::TESSELLATION_CONTROL, &ts.0);
-                    this.add_stage(vk::ShaderStageFlags::TESSELLATION_EVALUATION, &ts.1);
-                }
-                this.vertex_bindings = buffers.iter().map(|vbuf| {
-                    vk::VertexInputBindingDescription {
-                        binding: vbuf.binding,
-                        stride: vbuf.stride as u32,
-                        input_rate: match vbuf.rate {
-                            VertexInputRate::Vertex => vk::VertexInputRate::VERTEX,
-                            VertexInputRate::Instance(divisor) => {
-                                debug_assert_eq!(divisor, 1, "Custom vertex rate divisors not supported in Vulkan backend without extension");
-                                vk::VertexInputRate::INSTANCE
-                            },
-                        },
-                    }
-                }).collect();
-
-                this.vertex_attributes = attributes
-                    .iter()
-                    .map(|attr| vk::VertexInputAttributeDescription {
-                        location: attr.location as u32,
-                        binding: attr.binding as u32,
-                        format: conv::map_format(attr.element.format),
-                        offset: attr.element.offset as u32,
-                    })
-                    .collect();
-
-                this.vertex_input_state = vk::PipelineVertexInputStateCreateInfo::builder()
-                    .flags(vk::PipelineVertexInputStateCreateFlags::empty())
-                    .vertex_binding_descriptions(&this.vertex_bindings)
-                    .vertex_attribute_descriptions(&this.vertex_attributes)
-                    .build();
-
-                this.input_assembly_state = vk::PipelineInputAssemblyStateCreateInfo::builder()
-                    .flags(vk::PipelineInputAssemblyStateCreateFlags::empty())
-                    .topology(conv::map_topology(&input_assembler))
-                    .primitive_restart_enable(input_assembler.restart_index.is_some())
-                    .build();
-            }
-            pso::PrimitiveAssemblerDesc::Mesh { ref task, ref mesh } => {
-                this.vertex_bindings = Vec::new();
-                this.vertex_attributes = Vec::new();
-                this.vertex_input_state = vk::PipelineVertexInputStateCreateInfo::default();
-                this.input_assembly_state = vk::PipelineInputAssemblyStateCreateInfo::default();
-
-                // Task stage, optional
-                if let Some(ref entry) = task {
-                    this.add_stage(vk::ShaderStageFlags::TASK_NV, entry);
-                }
-
-                // Mesh stage
-                this.add_stage(vk::ShaderStageFlags::MESH_NV, mesh);
-            }
-        };
-
-        // Pixel stage
-        if let Some(ref entry) = desc.fragment {
-            this.add_stage(vk::ShaderStageFlags::FRAGMENT, entry);
-        }
-
-        let depth_bias = match desc.rasterizer.depth_bias {
-            Some(pso::State::Static(db)) => db,
-            Some(pso::State::Dynamic) => {
-                this.dynamic_states.push(vk::DynamicState::DEPTH_BIAS);
-                pso::DepthBias::default()
-            }
-            None => pso::DepthBias::default(),
-        };
-
-        let polygon_mode = match desc.rasterizer.polygon_mode {
-            pso::PolygonMode::Point => vk::PolygonMode::POINT,
-            pso::PolygonMode::Line => vk::PolygonMode::LINE,
-            pso::PolygonMode::Fill => vk::PolygonMode::FILL,
-        };
-
-        let line_width = match desc.rasterizer.line_width {
-            pso::State::Static(w) => w,
-            pso::State::Dynamic => {
-                this.dynamic_states.push(vk::DynamicState::LINE_WIDTH);
-                1.0
-            }
-        };
-
-        this.rasterization_conservative_state =
-            vk::PipelineRasterizationConservativeStateCreateInfoEXT::builder()
-                .conservative_rasterization_mode(match desc.rasterizer.conservative {
-                    false => vk::ConservativeRasterizationModeEXT::DISABLED,
-                    true => vk::ConservativeRasterizationModeEXT::OVERESTIMATE,
-                })
-                .build();
-
-        this.rasterization_state = {
-            let mut rasterization_state_builder =
-                vk::PipelineRasterizationStateCreateInfo::builder()
-                    .flags(vk::PipelineRasterizationStateCreateFlags::empty())
-                    .depth_clamp_enable(if desc.rasterizer.depth_clamping {
-                        if device.features.contains(Features::DEPTH_CLAMP) {
-                            true
-                        } else {
-                            warn!("Depth clamping was requested on a device with disabled feature");
-                            false
-                        }
-                    } else {
-                        false
-                    })
-                    .rasterizer_discard_enable(
-                        desc.fragment.is_none()
-                            && desc.depth_stencil.depth.is_none()
-                            && desc.depth_stencil.stencil.is_none(),
-                    )
-                    .polygon_mode(polygon_mode)
-                    .cull_mode(conv::map_cull_face(desc.rasterizer.cull_face))
-                    .front_face(conv::map_front_face(desc.rasterizer.front_face))
-                    .depth_bias_enable(desc.rasterizer.depth_bias.is_some())
-                    .depth_bias_constant_factor(depth_bias.const_factor)
-                    .depth_bias_clamp(depth_bias.clamp)
-                    .depth_bias_slope_factor(depth_bias.slope_factor)
-                    .line_width(line_width);
-            if desc.rasterizer.conservative {
-                rasterization_state_builder = rasterization_state_builder
-                    .push_next(&mut this.rasterization_conservative_state);
-            }
-
-            rasterization_state_builder.build()
-        };
-
-        this.tessellation_state = {
-            if let pso::PrimitiveAssemblerDesc::Vertex {
-                input_assembler, ..
-            } = &desc.primitive_assembler
-            {
-                if let pso::Primitive::PatchList(patch_control_points) = input_assembler.primitive {
-                    Some(
-                        vk::PipelineTessellationStateCreateInfo::builder()
-                            .flags(vk::PipelineTessellationStateCreateFlags::empty())
-                            .patch_control_points(patch_control_points as _)
-                            .build(),
-                    )
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        };
-
-        this.viewport_state = {
-            //Note: without `multiViewport` feature, there has to be
-            // the count of 1 for both viewports and scissors, even
-            // though the actual pointers are ignored.
-            match desc.baked_states.scissor {
-                Some(ref rect) => {
-                    this.scissors = [conv::map_rect(rect)];
-                }
-                None => {
-                    this.dynamic_states.push(vk::DynamicState::SCISSOR);
-                }
-            }
-            match desc.baked_states.viewport {
-                Some(ref vp) => {
-                    this.viewports = [device.map_viewport(vp)];
-                }
-                None => {
-                    this.dynamic_states.push(vk::DynamicState::VIEWPORT);
-                }
-            }
-            vk::PipelineViewportStateCreateInfo::builder()
-                .flags(vk::PipelineViewportStateCreateFlags::empty())
-                .scissors(&this.scissors)
-                .viewports(&this.viewports)
-                .build()
-        };
-
-        this.multisample_state = match desc.multisampling {
-            Some(ref ms) => {
-                this.sample_mask = [
-                    (ms.sample_mask & 0xFFFFFFFF) as u32,
-                    ((ms.sample_mask >> 32) & 0xFFFFFFFF) as u32,
-                ];
-                vk::PipelineMultisampleStateCreateInfo::builder()
-                    .flags(vk::PipelineMultisampleStateCreateFlags::empty())
-                    .rasterization_samples(conv::map_sample_count_flags(ms.rasterization_samples))
-                    .sample_shading_enable(ms.sample_shading.is_some())
-                    .min_sample_shading(ms.sample_shading.unwrap_or(0.0))
-                    .sample_mask(&this.sample_mask)
-                    .alpha_to_coverage_enable(ms.alpha_coverage)
-                    .alpha_to_one_enable(ms.alpha_to_one)
-                    .build()
-            }
-            None => vk::PipelineMultisampleStateCreateInfo::builder()
-                .flags(vk::PipelineMultisampleStateCreateFlags::empty())
-                .rasterization_samples(vk::SampleCountFlags::TYPE_1)
-                .build(),
-        };
-
-        let depth_stencil = desc.depth_stencil;
-        let (depth_test_enable, depth_write_enable, depth_compare_op) = match depth_stencil.depth {
-            Some(ref depth) => (true, depth.write as _, conv::map_comparison(depth.fun)),
-            None => (false, false, vk::CompareOp::NEVER),
-        };
-        let (stencil_test_enable, front, back) = match depth_stencil.stencil {
-            Some(ref stencil) => {
-                let mut front = conv::map_stencil_side(&stencil.faces.front);
-                let mut back = conv::map_stencil_side(&stencil.faces.back);
-                match stencil.read_masks {
-                    pso::State::Static(ref sides) => {
-                        front.compare_mask = sides.front;
-                        back.compare_mask = sides.back;
-                    }
-                    pso::State::Dynamic => {
-                        this.dynamic_states
-                            .push(vk::DynamicState::STENCIL_COMPARE_MASK);
-                    }
-                }
-                match stencil.write_masks {
-                    pso::State::Static(ref sides) => {
-                        front.write_mask = sides.front;
-                        back.write_mask = sides.back;
-                    }
-                    pso::State::Dynamic => {
-                        this.dynamic_states
-                            .push(vk::DynamicState::STENCIL_WRITE_MASK);
-                    }
-                }
-                match stencil.reference_values {
-                    pso::State::Static(ref sides) => {
-                        front.reference = sides.front;
-                        back.reference = sides.back;
-                    }
-                    pso::State::Dynamic => {
-                        this.dynamic_states
-                            .push(vk::DynamicState::STENCIL_REFERENCE);
-                    }
-                }
-                (true, front, back)
-            }
-            None => mem::zeroed(),
-        };
-        let (min_depth_bounds, max_depth_bounds) = match desc.baked_states.depth_bounds {
-            Some(ref range) => (range.start, range.end),
-            None => {
-                this.dynamic_states.push(vk::DynamicState::DEPTH_BOUNDS);
-                (0.0, 1.0)
-            }
-        };
-
-        this.depth_stencil_state = vk::PipelineDepthStencilStateCreateInfo::builder()
-            .flags(vk::PipelineDepthStencilStateCreateFlags::empty())
-            .depth_test_enable(depth_test_enable)
-            .depth_write_enable(depth_write_enable)
-            .depth_compare_op(depth_compare_op)
-            .depth_bounds_test_enable(depth_stencil.depth_bounds)
-            .stencil_test_enable(stencil_test_enable)
-            .front(front)
-            .back(back)
-            .min_depth_bounds(min_depth_bounds)
-            .max_depth_bounds(max_depth_bounds)
-            .build();
-
-        this.blend_states = desc
-            .blender
-            .targets
-            .iter()
-            .map(|color_desc| {
-                let color_write_mask =
-                    vk::ColorComponentFlags::from_raw(color_desc.mask.bits() as _);
-                match color_desc.blend {
-                    Some(ref bs) => {
-                        let (color_blend_op, src_color_blend_factor, dst_color_blend_factor) =
-                            conv::map_blend_op(bs.color);
-                        let (alpha_blend_op, src_alpha_blend_factor, dst_alpha_blend_factor) =
-                            conv::map_blend_op(bs.alpha);
-                        vk::PipelineColorBlendAttachmentState {
-                            color_write_mask,
-                            blend_enable: vk::TRUE,
-                            src_color_blend_factor,
-                            dst_color_blend_factor,
-                            color_blend_op,
-                            src_alpha_blend_factor,
-                            dst_alpha_blend_factor,
-                            alpha_blend_op,
-                        }
-                    }
-                    None => vk::PipelineColorBlendAttachmentState {
-                        color_write_mask,
-                        ..mem::zeroed()
-                    },
-                }
-            })
-            .collect();
-
-        this.color_blend_state = vk::PipelineColorBlendStateCreateInfo::builder()
-            .flags(vk::PipelineColorBlendStateCreateFlags::empty())
-            .logic_op_enable(false) // TODO
-            .logic_op(vk::LogicOp::CLEAR)
-            .attachments(&this.blend_states) // TODO:
-            .blend_constants(match desc.baked_states.blend_constants {
-                Some(value) => value,
-                None => {
-                    this.dynamic_states.push(vk::DynamicState::BLEND_CONSTANTS);
-                    [0.0; 4]
-                }
-            })
-            .build();
-
-        this.pipeline_dynamic_state = vk::PipelineDynamicStateCreateInfo::builder()
-            .flags(vk::PipelineDynamicStateCreateFlags::empty())
-            .dynamic_states(&this.dynamic_states)
-            .build();
-
-        this
+        );
     }
 }
 
@@ -736,7 +421,334 @@ impl d::Device<B> for super::Device {
         cache: Option<&n::PipelineCache>,
     ) -> Result<n::GraphicsPipeline, pso::CreationError> {
         debug!("create_graphics_pipeline {:?}", desc);
-        let buf = GraphicsPipelineInfoBuf::new(desc, &self.shared);
+        let device = &self.shared;
+        let stage_buf = StageInfoBuf::default();
+
+        // 10 is the max amount of dynamic states
+        let dynamic_states: PushArrayVec<vk::DynamicState, 10> = Default::default();
+
+        let vertex_bindings: Vec<vk::VertexInputBindingDescription>;
+        let vertex_attributes: Vec<vk::VertexInputAttributeDescription>;
+
+        let vertex_input_state: vk::PipelineVertexInputStateCreateInfoBuilder<'_>;
+        let input_assembly_state: vk::PipelineInputAssemblyStateCreateInfoBuilder<'_>;
+
+        match desc.primitive_assembler {
+            pso::PrimitiveAssemblerDesc::Vertex {
+                ref buffers,
+                ref attributes,
+                ref input_assembler,
+                ref vertex,
+                ref tessellation,
+                ref geometry,
+            } => {
+                // Vertex stage
+                // vertex shader is required
+                stage_buf.add_stage(vk::ShaderStageFlags::VERTEX, vertex);
+
+                // Geometry stage
+                if let Some(ref entry) = geometry {
+                    stage_buf.add_stage(vk::ShaderStageFlags::GEOMETRY, entry);
+                }
+                // Tessellation stage
+                if let Some(ts) = tessellation {
+                    stage_buf.add_stage(vk::ShaderStageFlags::TESSELLATION_CONTROL, &ts.0);
+                    stage_buf.add_stage(vk::ShaderStageFlags::TESSELLATION_EVALUATION, &ts.1);
+                }
+                vertex_bindings = buffers.iter().map(|vbuf| {
+                    vk::VertexInputBindingDescription {
+                        binding: vbuf.binding,
+                        stride: vbuf.stride as u32,
+                        input_rate: match vbuf.rate {
+                            VertexInputRate::Vertex => vk::VertexInputRate::VERTEX,
+                            VertexInputRate::Instance(divisor) => {
+                                debug_assert_eq!(divisor, 1, "Custom vertex rate divisors not supported in Vulkan backend without extension");
+                                vk::VertexInputRate::INSTANCE
+                            },
+                        },
+                    }
+                }).collect();
+
+                vertex_attributes = attributes
+                    .iter()
+                    .map(|attr| vk::VertexInputAttributeDescription {
+                        location: attr.location as u32,
+                        binding: attr.binding as u32,
+                        format: conv::map_format(attr.element.format),
+                        offset: attr.element.offset as u32,
+                    })
+                    .collect();
+
+                vertex_input_state = vk::PipelineVertexInputStateCreateInfo::builder()
+                    .flags(vk::PipelineVertexInputStateCreateFlags::empty())
+                    .vertex_binding_descriptions(&vertex_bindings)
+                    .vertex_attribute_descriptions(&vertex_attributes);
+
+                input_assembly_state = vk::PipelineInputAssemblyStateCreateInfo::builder()
+                    .flags(vk::PipelineInputAssemblyStateCreateFlags::empty())
+                    .topology(conv::map_topology(&input_assembler))
+                    .primitive_restart_enable(input_assembler.restart_index.is_some());
+            }
+            pso::PrimitiveAssemblerDesc::Mesh { ref task, ref mesh } => {
+                vertex_input_state = vk::PipelineVertexInputStateCreateInfo::builder();
+                input_assembly_state = vk::PipelineInputAssemblyStateCreateInfo::builder();
+
+                // Task stage, optional
+                if let Some(ref entry) = task {
+                    stage_buf.add_stage(vk::ShaderStageFlags::TASK_NV, entry);
+                }
+
+                // Mesh stage
+                stage_buf.add_stage(vk::ShaderStageFlags::MESH_NV, mesh);
+            }
+        }
+
+        // Pixel stage
+        if let Some(ref entry) = desc.fragment {
+            stage_buf.add_stage(vk::ShaderStageFlags::FRAGMENT, entry);
+        }
+
+        let depth_bias = match desc.rasterizer.depth_bias {
+            Some(pso::State::Static(db)) => db,
+            Some(pso::State::Dynamic) => {
+                dynamic_states.push(vk::DynamicState::DEPTH_BIAS);
+                pso::DepthBias::default()
+            }
+            None => pso::DepthBias::default(),
+        };
+
+        let polygon_mode = match desc.rasterizer.polygon_mode {
+            pso::PolygonMode::Point => vk::PolygonMode::POINT,
+            pso::PolygonMode::Line => vk::PolygonMode::LINE,
+            pso::PolygonMode::Fill => vk::PolygonMode::FILL,
+        };
+
+        let line_width = match desc.rasterizer.line_width {
+            pso::State::Static(w) => w,
+            pso::State::Dynamic => {
+                dynamic_states.push(vk::DynamicState::LINE_WIDTH);
+                1.0
+            }
+        };
+
+        let mut rasterization_conservative_state =
+            vk::PipelineRasterizationConservativeStateCreateInfoEXT::builder()
+                .conservative_rasterization_mode(match desc.rasterizer.conservative {
+                    false => vk::ConservativeRasterizationModeEXT::DISABLED,
+                    true => vk::ConservativeRasterizationModeEXT::OVERESTIMATE,
+                });
+
+        let rasterization_state = {
+            let mut rasterization_state_builder =
+                vk::PipelineRasterizationStateCreateInfo::builder()
+                    .flags(vk::PipelineRasterizationStateCreateFlags::empty())
+                    .depth_clamp_enable(if desc.rasterizer.depth_clamping {
+                        if device.features.contains(Features::DEPTH_CLAMP) {
+                            true
+                        } else {
+                            warn!("Depth clamping was requested on a device with disabled feature");
+                            false
+                        }
+                    } else {
+                        false
+                    })
+                    .rasterizer_discard_enable(
+                        desc.fragment.is_none()
+                            && desc.depth_stencil.depth.is_none()
+                            && desc.depth_stencil.stencil.is_none(),
+                    )
+                    .polygon_mode(polygon_mode)
+                    .cull_mode(conv::map_cull_face(desc.rasterizer.cull_face))
+                    .front_face(conv::map_front_face(desc.rasterizer.front_face))
+                    .depth_bias_enable(desc.rasterizer.depth_bias.is_some())
+                    .depth_bias_constant_factor(depth_bias.const_factor)
+                    .depth_bias_clamp(depth_bias.clamp)
+                    .depth_bias_slope_factor(depth_bias.slope_factor)
+                    .line_width(line_width);
+            if desc.rasterizer.conservative {
+                rasterization_state_builder =
+                    rasterization_state_builder.push_next(&mut rasterization_conservative_state);
+            }
+
+            rasterization_state_builder
+        };
+
+        let tessellation_state = {
+            if let pso::PrimitiveAssemblerDesc::Vertex {
+                input_assembler, ..
+            } = &desc.primitive_assembler
+            {
+                if let pso::Primitive::PatchList(patch_control_points) = input_assembler.primitive {
+                    Some(
+                        vk::PipelineTessellationStateCreateInfo::builder()
+                            .flags(vk::PipelineTessellationStateCreateFlags::empty())
+                            .patch_control_points(patch_control_points as _),
+                    )
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+
+        let mut viewports: [vk::Viewport; 1] = Default::default();
+        let mut scissors: [vk::Rect2D; 1] = Default::default();
+        let viewport_state = {
+            //Note: without `multiViewport` feature, there has to be
+            // the count of 1 for both viewports and scissors, even
+            // though the actual pointers are ignored.
+            match desc.baked_states.scissor {
+                Some(ref rect) => {
+                    scissors = [conv::map_rect(rect)];
+                }
+                None => {
+                    dynamic_states.push(vk::DynamicState::SCISSOR);
+                }
+            }
+            match desc.baked_states.viewport {
+                Some(ref vp) => {
+                    viewports = [device.map_viewport(vp)];
+                }
+                None => {
+                    dynamic_states.push(vk::DynamicState::VIEWPORT);
+                }
+            }
+            vk::PipelineViewportStateCreateInfo::builder()
+                .flags(vk::PipelineViewportStateCreateFlags::empty())
+                .scissors(&scissors)
+                .viewports(&viewports)
+        };
+
+        let sample_mask: [u32; 2];
+        let multisample_state = match desc.multisampling {
+            Some(ref ms) => {
+                sample_mask = [
+                    (ms.sample_mask & 0xFFFFFFFF) as u32,
+                    ((ms.sample_mask >> 32) & 0xFFFFFFFF) as u32,
+                ];
+                vk::PipelineMultisampleStateCreateInfo::builder()
+                    .flags(vk::PipelineMultisampleStateCreateFlags::empty())
+                    .rasterization_samples(conv::map_sample_count_flags(ms.rasterization_samples))
+                    .sample_shading_enable(ms.sample_shading.is_some())
+                    .min_sample_shading(ms.sample_shading.unwrap_or(0.0))
+                    .sample_mask(&sample_mask)
+                    .alpha_to_coverage_enable(ms.alpha_coverage)
+                    .alpha_to_one_enable(ms.alpha_to_one)
+            }
+            None => vk::PipelineMultisampleStateCreateInfo::builder()
+                .flags(vk::PipelineMultisampleStateCreateFlags::empty())
+                .rasterization_samples(vk::SampleCountFlags::TYPE_1),
+        };
+
+        let depth_stencil = desc.depth_stencil;
+        let (depth_test_enable, depth_write_enable, depth_compare_op) = match depth_stencil.depth {
+            Some(ref depth) => (true, depth.write as _, conv::map_comparison(depth.fun)),
+            None => (false, false, vk::CompareOp::NEVER),
+        };
+        let (stencil_test_enable, front, back) = match depth_stencil.stencil {
+            Some(ref stencil) => {
+                let mut front = conv::map_stencil_side(&stencil.faces.front);
+                let mut back = conv::map_stencil_side(&stencil.faces.back);
+                match stencil.read_masks {
+                    pso::State::Static(ref sides) => {
+                        front.compare_mask = sides.front;
+                        back.compare_mask = sides.back;
+                    }
+                    pso::State::Dynamic => {
+                        dynamic_states.push(vk::DynamicState::STENCIL_COMPARE_MASK);
+                    }
+                }
+                match stencil.write_masks {
+                    pso::State::Static(ref sides) => {
+                        front.write_mask = sides.front;
+                        back.write_mask = sides.back;
+                    }
+                    pso::State::Dynamic => {
+                        dynamic_states.push(vk::DynamicState::STENCIL_WRITE_MASK);
+                    }
+                }
+                match stencil.reference_values {
+                    pso::State::Static(ref sides) => {
+                        front.reference = sides.front;
+                        back.reference = sides.back;
+                    }
+                    pso::State::Dynamic => {
+                        dynamic_states.push(vk::DynamicState::STENCIL_REFERENCE);
+                    }
+                }
+                (true, front, back)
+            }
+            None => mem::zeroed(),
+        };
+        let (min_depth_bounds, max_depth_bounds) = match desc.baked_states.depth_bounds {
+            Some(ref range) => (range.start, range.end),
+            None => {
+                dynamic_states.push(vk::DynamicState::DEPTH_BOUNDS);
+                (0.0, 1.0)
+            }
+        };
+
+        let depth_stencil_state = vk::PipelineDepthStencilStateCreateInfo::builder()
+            .flags(vk::PipelineDepthStencilStateCreateFlags::empty())
+            .depth_test_enable(depth_test_enable)
+            .depth_write_enable(depth_write_enable)
+            .depth_compare_op(depth_compare_op)
+            .depth_bounds_test_enable(depth_stencil.depth_bounds)
+            .stencil_test_enable(stencil_test_enable)
+            .front(front)
+            .back(back)
+            .min_depth_bounds(min_depth_bounds)
+            .max_depth_bounds(max_depth_bounds);
+
+        let blend_states = desc
+            .blender
+            .targets
+            .iter()
+            .map(|color_desc| {
+                let color_write_mask =
+                    vk::ColorComponentFlags::from_raw(color_desc.mask.bits() as _);
+                match color_desc.blend {
+                    Some(ref bs) => {
+                        let (color_blend_op, src_color_blend_factor, dst_color_blend_factor) =
+                            conv::map_blend_op(bs.color);
+                        let (alpha_blend_op, src_alpha_blend_factor, dst_alpha_blend_factor) =
+                            conv::map_blend_op(bs.alpha);
+                        vk::PipelineColorBlendAttachmentState {
+                            color_write_mask,
+                            blend_enable: vk::TRUE,
+                            src_color_blend_factor,
+                            dst_color_blend_factor,
+                            color_blend_op,
+                            src_alpha_blend_factor,
+                            dst_alpha_blend_factor,
+                            alpha_blend_op,
+                        }
+                    }
+                    None => vk::PipelineColorBlendAttachmentState {
+                        color_write_mask,
+                        ..mem::zeroed()
+                    },
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let color_blend_state = vk::PipelineColorBlendStateCreateInfo::builder()
+            .flags(vk::PipelineColorBlendStateCreateFlags::empty())
+            .logic_op_enable(false) // TODO
+            .logic_op(vk::LogicOp::CLEAR)
+            .attachments(&blend_states) // TODO:
+            .blend_constants(match desc.baked_states.blend_constants {
+                Some(value) => value,
+                None => {
+                    dynamic_states.push(vk::DynamicState::BLEND_CONSTANTS);
+                    [0.0; 4]
+                }
+            });
+
+        let pipeline_dynamic_state = vk::PipelineDynamicStateCreateInfo::builder()
+            .flags(vk::PipelineDynamicStateCreateFlags::empty())
+            .dynamic_states(&dynamic_states);
 
         let info = {
             let (base_handle, base_index) = match desc.parent {
@@ -767,20 +779,20 @@ impl d::Device<B> for super::Device {
 
             let builder = vk::GraphicsPipelineCreateInfo::builder()
                 .flags(flags)
-                .stages(&buf.stages)
-                .vertex_input_state(&buf.vertex_input_state)
-                .input_assembly_state(&buf.input_assembly_state)
-                .rasterization_state(&buf.rasterization_state);
-            let builder = match buf.tessellation_state.as_ref() {
+                .stages(&stage_buf.stages)
+                .vertex_input_state(&vertex_input_state)
+                .input_assembly_state(&input_assembly_state)
+                .rasterization_state(&rasterization_state);
+            let builder = match tessellation_state.as_ref() {
                 Some(t) => builder.tessellation_state(t),
                 None => builder,
             };
             builder
-                .viewport_state(&buf.viewport_state)
-                .multisample_state(&buf.multisample_state)
-                .depth_stencil_state(&buf.depth_stencil_state)
-                .color_blend_state(&buf.color_blend_state)
-                .dynamic_state(&buf.pipeline_dynamic_state)
+                .viewport_state(&viewport_state)
+                .multisample_state(&multisample_state)
+                .depth_stencil_state(&depth_stencil_state)
+                .color_blend_state(&color_blend_state)
+                .dynamic_state(&pipeline_dynamic_state)
                 .layout(desc.layout.raw)
                 .render_pass(desc.subpass.main_pass.raw)
                 .subpass(desc.subpass.index as _)
