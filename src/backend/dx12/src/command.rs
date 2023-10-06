@@ -430,11 +430,11 @@ pub struct CommandBuffer {
     /// So we must cache the implied state for these partial updates.
     viewport_cache: ArrayVec<
         d3d12::D3D12_VIEWPORT,
-            d3d12::D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE as usize,
+        { d3d12::D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE as usize },
     >,
     scissor_cache: ArrayVec<
         d3d12::D3D12_RECT,
-            d3d12::D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE as usize,
+        { d3d12::D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE as usize },
     >,
 
     /// HACK: renderdoc workaround for temporary RTVs

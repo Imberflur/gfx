@@ -1,4 +1,3 @@
-use arrayvec::ArrayVec;
 use ash::{extensions::khr, version::DeviceV1_0, vk};
 use inplace_it::inplace_or_alloc_from_iter;
 use smallvec::SmallVec;

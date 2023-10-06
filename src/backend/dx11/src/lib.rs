@@ -1865,7 +1865,7 @@ impl CommandBufferState {
 }
 
 type PerConstantBufferVec<T> =
-    ArrayVec<T, d3d11::D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT as _>;
+    ArrayVec<T, { d3d11::D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT as _ }>;
 
 fn generate_graphics_dynamic_constant_buffer_offsets<'a>(
     bindings: impl IntoIterator<Item = &'a pso::DescriptorSetLayoutBinding>,
